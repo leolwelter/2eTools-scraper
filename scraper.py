@@ -2,16 +2,16 @@ import dataclasses
 import os
 import sys
 from enum import Enum
-from typing import List, Optional, Tuple, Match, Any
+from typing import List, Optional, Tuple, Match, Any, Dict
 from urllib.error import HTTPError
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
 import urllib.request as fetch
 from pymongo import MongoClient
 import re
 
-from creature import Creature, Header, Action
+from creature import Creature, Header, Action, Sidebar, Strike
 from trait import Trait
-from config import config
+from local_config import config
 
 
 class GameType(Enum):
@@ -61,7 +61,117 @@ def fetch_pages(typ: GameType, cache_only: bool = None) -> Optional[List[str]]:
     return pages
 
 
+def get_abilities(start_tag: Tag) -> Tuple[List[Action], Tag]:
+    ability_tag = start_tag
+    while ability_tag.next:
+        if ability_tag.name == 'b' or ability_tag.name == 'hr':
+            break
+        ability_tag = ability_tag.next
+
+    abilities: List[Action] = []
+    descr_arr: List[str] = []
+    name_arr: List[str] = []
+    inter_str: str = ''
+    while ability_tag.next:
+        if ability_tag.name == 'hr':
+            descr_arr.append(inter_str)
+            break
+        if type(ability_tag) == NavigableString:
+            inter_str = ''.join((inter_str, ability_tag.string))
+        elif ability_tag.name == 'b':
+            if ability_tag.string and ability_tag.string.strip() != 'Trigger' and ability_tag.string.strip() != 'Effect':
+                name_arr.append(ability_tag.string.strip())
+            elif not ability_tag.string and type(ability_tag.next) == NavigableString:
+                name_arr.append(ability_tag.next.string.strip())  # just assume next NavigableString is the label
+        elif ability_tag.name and ability_tag.get('alt') and ability_tag.get('class') == ['actiondark']:
+            inter_str = ''.join((inter_str, ability_tag.get('alt')))
+        elif ability_tag.name == 'br':
+            descr_arr.append(inter_str)
+            inter_str = ''
+        ability_tag = ability_tag.next
+
+    ability_re = re.compile(r'\s*((?P<cost>(Single Action|Two Actions|Three Actions|Reaction|Free Action)+)\s*)?'
+                            r'(\((?P<traits>[\w, ]+)\)\s*)?'
+                            r'(Trigger\s*(?P<trigger>[\w\d\s\-()\'’+.,]+)[.;]?\s*Effect\s*)?'
+                            r'(Requirements\s*(?P<requirements>[\w\d\s\-()\'’+.,]+);\s*)?'
+                            r'(Effect\s*)?(?P<description>.*)\s*')
+    for (name, descr) in zip(name_arr, descr_arr):
+        if name == 'Items':
+            continue
+        descr = descr.replace(name, '', 1)
+        ab_match = re.match(ability_re, descr)
+        act = Action()
+        if not ab_match:
+            raise ValueError('no ability match found for ability')
+        act.cost = ab_match.group('cost') if ab_match.group('cost') else ''
+        act.trigger = ab_match.group('trigger') if ab_match.group('trigger') else ''
+        act.traits = [x.strip() for x in ab_match.group('traits').split(',')] if ab_match.group('traits') else []
+        act.requirements = ab_match.group('requirements') if ab_match.group('requirements') else ''
+        act.description = ab_match.group('description')
+        act.name = name
+        abilities.append(act)
+    return abilities, ability_tag
+
+
+# parse all of the strikes found after start_tag
+# if reaching a header (h1/2/3) or a spellcasting entry, or a sidebar entry, or div.class is ['clear'], stop iterating
+def get_strikes(start_tag: Tag) -> Tuple[List[Action], Tag]:
+    strikes: List[Action] = []
+    tag = start_tag  # assumed start at the 'b' Speed tag
+    active_entries: Optional[List[Tag]] = tag.previous.find_all_next('span', class_=['hanging-indent'])
+    strike_str = ''
+    strike_re = re.compile(r'\s*(?P<typ>Melee|Ranged)\s*'
+                           r'(?P<cost>SingleAction|TwoActions|ThreeActions)\s*'
+                           r'(?P<name>[\w\d\s\-()\'’+.,]+)\s*'
+                           r'(?P<mod>[+\-]+\d+)\s*'
+                           r'(?P<multi>\[[+\-]+\d+/[+\-]+\d+\]\s*)?'
+                           r'(\((?P<traits>[\w, ]+)\)\s*)?'
+                           r'(,\s*Damage\s*(?P<damage>[\w\d\s\-()\'’+.,]+)\s*)?'
+                           r'(,\s*Effect\s*(?P<effect>[\w\d\s\-()\'’+.,]+)\s*)?')
+    for entry in active_entries:
+        strike_str = ''.join([x.string for x in entry.children if not x.name])
+        match = re.match(strike_re, strike_str)
+        if match:
+            gd = match.groupdict()
+            strike = Strike(gd['cost'], gd['name'], gd['traits'].split(','), gd['frequency'], gd['description'],
+                            damage=gd['damage'], strikeType=gd['typ'])
+            strikes.append(strike)
+
+    return strikes, tag
+
+
+def get_spells(c: Creature, start_tag: Tag) -> Tuple[Creature, Tag]:
+    tag = start_tag.next
+    return c, tag
+
+
+def get_sidebars(start_tag: Tag) -> Tuple[List[Sidebar], Tag]:
+    sidebars: List[Sidebar] = []
+    tag = start_tag.next
+    return sidebars, tag
+
+
 def parse_creatures(pages: List[str]) -> Optional[List[object]]:
+    # parse the families of creatures from http://2e.aonprd.com/Monsters.aspx?Letter=All
+    try:
+        with fetch.urlopen('http://2e.aonprd.com/Monsters.aspx?Letter=All') as inf:
+            fam_page = inf.read()
+            if not fam_page:
+                raise ValueError('unable to fetch families table from AoN')
+    except Exception:
+        print('error fetching family table')
+        sys.exit(1)
+
+    fam_table: List[Tag] = BeautifulSoup(fam_page, 'html.parser').find_all('tr')
+    fams = {}
+    for tr in fam_table[1:]:
+        name = tr.findChildren('td')[0].a.u.string
+        fam = str(tr.findChildren('td')[1].string).strip()
+        if fams.get(fam):
+            fams.get(fam).append(name)
+        else:
+            fams[fam] = [name]
+
     creatures: List[object] = []
     for ind, page in enumerate(pages):
         if page == '':
@@ -82,31 +192,26 @@ def parse_creatures(pages: List[str]) -> Optional[List[object]]:
         creature.source.book = src[0]
         creature.source.page = int(src[1])
 
-        # HP
+        # HP TODO REWORK THE WHOLE SECTION
         hp_tag = main_tag
+        hp_re = re.compile(r'\s*HP\s*(?P<hp>[0-9]+);?\s*(?P<hp_notes>[\w\d\s\-()\'’+.,]*);?\s*')
         while hp_tag.next:
             if hp_tag.name and hp_tag.name == 'b' and hp_tag.text == 'HP':
                 break
-            else:
-                hp_tag = hp_tag.next
+            hp_tag = hp_tag.next
 
-        while not (hp_tag.name == 'br'
-                   or hp_tag.name == 'hr'
-                   or (hp_tag.name == 'b' and hp_tag.text in ['Immunities', 'Resistances', 'Weaknesses'])):
-            if hp_tag.name and creature.hitPoints == 0 and hp_tag.text == 'HP' and type(
-                    hp_tag.next_sibling) == NavigableString:
-                info = str(hp_tag.next_sibling)
-                hp_match = re.match(re.compile(r'\s*(?P<hp>[0-9]+);?\s*(?P<hp_notes>[\w()0-9,\'\" ]*);?\s*'), info)
-                creature.hitPoints = int(hp_match.group('hp')) if hp_match else 0
-                # creature.hitPointsNotes = hp_match.group('hp_notes') if hp_match else 0
-            # concatenate any text after actual hitPoints into hitPointsNotes
-            elif creature.hitPoints != 0 and not hp_tag.name:
-                creature.hitPointsNotes = ''.join((creature.hitPointsNotes, hp_tag.string))
-
-            if hp_tag.next:
-                hp_tag = hp_tag.next
-            else:
+        hp_str = ''
+        while hp_tag.next:
+            if hp_tag.name == 'br' or hp_tag.name == 'hr':
+                    # or (hp_tag.name == 'b' and hp_tag.string in ['Immunities', 'Resistances', 'Weaknesses']):
                 break
+            if type(hp_tag) == NavigableString:
+                hp_str = ''.join((hp_str, hp_tag.string))
+            hp_tag = hp_tag.next
+
+        hp_match = re.match(hp_re, hp_str)
+        creature.hitPoints = int(hp_match.groupdict().get('hp'))
+        creature.hitPointsNotes = hp_match.groupdict().get('hp_notes')
 
         regen_re = re.compile(
             r'\s*[rR]egeneration (?P<regen>[0-9]+)\s*,?\s*\(?deactivated by\s*(?P<deactivated>[\w ]+)\)?\s*')
@@ -259,53 +364,7 @@ def parse_creatures(pages: List[str]) -> Optional[List[object]]:
             creature.items = [x.strip() for x in item_matches if x.strip()]
 
         # interaction abilities
-        inter_tag = abm_tag
-        while inter_tag.next:
-            if inter_tag.name == 'b' or inter_tag.name == 'hr':
-                break
-            inter_tag = inter_tag.next
-
-        descr_arr: List[str] = []
-        name_arr: List[str] = []
-        inter_str: str = ''
-        while inter_tag.next:
-            if inter_tag.name == 'hr':
-                descr_arr.append(inter_str)
-                break
-            if type(inter_tag) == NavigableString:
-                inter_str = ''.join((inter_str, inter_tag.string))
-            elif inter_tag.name == 'b':
-                if inter_tag.string and inter_tag.string.strip() != 'Trigger' and inter_tag.string.strip() != 'Effect':
-                    name_arr.append(inter_tag.string.strip())
-                elif not inter_tag.string and type(inter_tag.next) == NavigableString:
-                    name_arr.append(inter_tag.next.string.strip())  # just assume next NavigableString is the label
-            elif inter_tag.name and inter_tag.get('alt') and inter_tag.get('class') == ['actiondark']:
-                inter_str = ''.join((inter_str, inter_tag.get('alt')))
-            elif inter_tag.name == 'br':
-                descr_arr.append(inter_str)
-                inter_str = ''
-            inter_tag = inter_tag.next
-
-        ability_re = re.compile(r'\s*((?P<cost>(Single Action|Two Actions|Three Actions|Reaction)+)\s*)?'
-                                r'(\((?P<traits>[\w, ]+)\)\s*)?'
-                                r'(Trigger\s*(?P<trigger>[\w\d\s\-()\'+.,]+);\s*)?'
-                                r'(Requirements\s*(?P<requirements>[\w\d\s\-()\'+.,]+);\s*)?'
-                                r'(Effect\s*)?(?P<description>.*)\s*')
-        for (name, descr) in zip(name_arr, descr_arr):
-            if name == 'Items':
-                continue
-            descr = descr.replace(name, '', 1)
-            ab_match = re.match(ability_re, descr)
-            act = Action()
-            if not ab_match:
-                raise ValueError('no ability match found for ability')
-            act.cost = ab_match.group('cost') if ab_match.group('cost') else ''
-            act.trigger = ab_match.group('trigger') if ab_match.group('trigger') else ''
-            act.traits = [x.strip() for x in ab_match.group('traits').split(',')] if ab_match.group('traits') else []
-            act.requirements = ab_match.group('requirements') if ab_match.group('requirements') else ''
-            act.description = ab_match.group('description')
-            act.name = name
-            creature.interactionAbilities.append(act)
+        creature.interactionAbilities, _ = get_abilities(abm_tag)
 
         # AC
         ac_tag = main_tag
@@ -348,8 +407,36 @@ def parse_creatures(pages: List[str]) -> Optional[List[object]]:
         creature.willNotes = saves_match.group('will_notes')
         creature.saveNotes = saves_match.group('save_notes')
 
-        # NAVIGABLE STRINGS CAUSE RECURSION EXCEPTIONS. Convert to str before setting fields
+        # automatic abilities
+        creature.automaticAbilities, _ = get_abilities(hp_tag)
+
+        # speed
+        speed_tag = hp_tag.next
+        speed_str = ''
+        while speed_tag.next:
+            if speed_tag.name == 'b' and speed_tag.string == 'Speed':
+                break
+            speed_tag = speed_tag.next
+        while speed_tag.next and speed_tag.name != 'hr' and speed_tag.name != 'br':
+            if type(speed_tag) == NavigableString and speed_tag.string.strip() != 'Speed':
+                speed_str = ''.join((speed_str, speed_tag.string))
+            speed_tag = speed_tag.next
+        creature.speed = speed_str
+
+        # offensive/proactive abilities
+        action_tag: Tag = speed_tag.next
+        creature.strikes, action_tag = get_strikes(action_tag)
+        creature, action_tag = get_spells(creature, action_tag)
+        creature.activeAbilities, action_tag = get_abilities(action_tag)
+        creature.sidebars, action_tag = get_sidebars(action_tag)
+
+        # set family
+        creature.family = [k for (k, v) in fams.items() if creature.name in v]
+        creature.family = creature.family[0] if creature.family else '—'
+
+        # NAVIGABLE STRINGS CAUSE RECURSION MAX DEPTH EXCEPTIONS. Convert to str before setting fields
         creatures.append(dataclasses.asdict(creature))
+
     return creatures
 
 
