@@ -2,14 +2,16 @@ import dataclasses
 import os
 import sys
 from enum import Enum
-from typing import List, Optional, Tuple, Match, Any, Dict
+from typing import List, Optional, Tuple, Match, Any, Union
 from urllib.error import HTTPError
 from bs4 import BeautifulSoup, NavigableString, Tag
 import urllib.request as fetch
 from pymongo import MongoClient
 import re
 
+from ancestry import Ancestry, AncestryHeader
 from creature import Creature, Header, Action, Sidebar, Strike
+from source import Source
 from trait import Trait
 from local_config import config
 
@@ -19,6 +21,7 @@ class GameType(Enum):
     SPELL = 'spell'
     TRAIT = 'trait'
     WEAPON = 'weapon'
+    ANCESTRY = 'ancestry'
 
 
 # includes empty strings for bad pages on AoN
@@ -31,7 +34,11 @@ def fetch_pages(typ: GameType, cache_only: bool = None) -> Optional[List[str]]:
     elif typ == GameType.TRAIT:
         fetch_url: str = 'https://2e.aonprd.com/Traits.aspx?id={}'
         data_path: str = 'data/traits/{}.html'
-        max_id: int = 315
+        max_id: int = 316
+    elif typ == GameType.ANCESTRY:
+        fetch_url: str = 'https://2e.aonprd.com/Ancestries.aspx?id={}'
+        data_path: str = 'data/ancestries/{}.html'
+        max_id: int = 22
     else:
         return None
 
@@ -203,7 +210,7 @@ def parse_creatures(pages: List[str]) -> Optional[List[object]]:
         hp_str = ''
         while hp_tag.next:
             if hp_tag.name == 'br' or hp_tag.name == 'hr':
-                    # or (hp_tag.name == 'b' and hp_tag.string in ['Immunities', 'Resistances', 'Weaknesses']):
+                # or (hp_tag.name == 'b' and hp_tag.string in ['Immunities', 'Resistances', 'Weaknesses']):
                 break
             if type(hp_tag) == NavigableString:
                 hp_str = ''.join((hp_str, hp_tag.string))
@@ -444,7 +451,7 @@ def parse_traits(pages: List[str]) -> Optional[List[object]]:
     traits: List[Any] = []
     for ind, page in enumerate(pages):
         if page == '':
-            continue  # placeholder to properly ennumerate "bad" array items
+            continue  # placeholder to properly enumerate "bad" array items
         print('parsing id={}\tof\t{}'.format(ind + 1, len(pages)))
         trait = Trait()
         whole_text = BeautifulSoup(page, 'html.parser').find('span', {'id': 'ctl00_MainContent_DetailedOutput'})
@@ -492,6 +499,153 @@ def parse_traits(pages: List[str]) -> Optional[List[object]]:
     return traits
 
 
+def parse_table_into_list(tag: Tag) -> List[List[str]]:
+    table = []
+    rows = [x.find_all('td') for x in [t for t in tag.next.children if t.name and t.name == 'tr']]
+    table.append([str(t.find('b').string) for t in rows[0]])
+    for col in rows[1:]:
+        table.append([str(t.string) for t in col])
+    return table
+
+
+def parse_ancestries(pages: List[str]) -> Optional[List[object]]:
+    ancestries: List[Ancestry] = []
+    for ind, page in enumerate(pages):
+        if page == '':
+            continue  # placeholder to properly enumerate "bad" array items
+        anc: Ancestry = Ancestry()
+        anc.id = ind + 1
+        whole_text = BeautifulSoup(page, 'html5lib').find('span', {'id': 'ctl00_MainContent_DetailedOutput'})
+
+        # get name
+        name_tags = [t for t in whole_text.find_next('h1').children if t.string]
+        for m in name_tags:
+            if m.string:
+                anc.name = ''.join((anc.name, m.string))
+
+        # if this is just a heritage, we don't parse it
+        if 'Heritage' in anc.name:
+            continue
+
+        # get rarity and traits
+        uncommon: Tag = whole_text.find_next(class_='traituncommon')
+        rare: Tag = whole_text.find_next(class_='traitrare')
+        if uncommon:
+            anc.rarity = uncommon.string.strip()
+        elif rare:
+            anc.rarity = rare.string.strip()
+        traits: List[Tag] = whole_text.find_all_next(class_='trait')
+        anc.traits = [str(t.string) for t in traits if t]
+
+        # get source
+        src: str = whole_text.find_next(name='b', text='Source').find_next(name='a').string
+        anc.source.book = src.split('pg.')[0].strip()
+        anc.source.page = int(src.split('pg.')[1])
+
+        # get description and other entries
+        m_tag = whole_text.find_next(name='b', text='Source').find_next(name='br')
+        d_str = ''
+        d_header = ''
+        d_entries = []
+        while m_tag.next:
+            if m_tag.name and m_tag.name == 'h1':
+                d_str = d_str.replace(d_header, '', 1)
+                d_entries.append(AncestryHeader(d_header, d_str.strip()))
+                break
+            if type(m_tag) == NavigableString:
+                d_str = ''.join((d_str, m_tag.string))
+            elif m_tag.name == 'br':
+                d_str = ''.join((d_str, '\n'))
+            elif m_tag.name == 'h2' or m_tag.name == 'h3':
+                d_str = d_str.replace(d_header, '', 1)
+                d_entries.append(AncestryHeader(d_header, d_str.strip()))
+                d_header = m_tag.string.strip()
+                d_str = ''
+            m_tag = m_tag.next
+        anc.description = d_entries
+
+        # Hit Points, Size, Speed, Ability Boosts (Flaws), Languages, Senses, Extra(s)
+        # usually in that order (?)
+        # then break when m_tag == m_tag.find_next(name='div', class_='clear').previous.previous.previous
+        d_str = ''
+        anc.hitPoints = str(m_tag.find_next(name='h2', text='Hit Points').next.next)
+        anc.size = str(m_tag.find_next(name='h2', text='Size').next.next)
+        anc.speed = str(m_tag.find_next(name='h2', text='Speed').next.next)
+        boosts_tag = m_tag.find_next(name='h2', text='Ability Boosts').next.next
+        while boosts_tag.next:
+            if boosts_tag.name and boosts_tag.name == 'h2':
+                break
+            if type(boosts_tag) == NavigableString:
+                d_str = ''.join((d_str, boosts_tag.string))
+            elif boosts_tag.name == 'br':
+                d_str = ''.join((d_str, '\n'))
+            boosts_tag = boosts_tag.next
+        anc.abilityBoosts = [d for d in d_str.split('\n') if d]
+        flaws_tag = m_tag.find_next(name='h2', text='Ability Flaw(s)')
+        if flaws_tag:
+            d_str = ''  # reset
+            flaws_tag = flaws_tag.next.next
+            while flaws_tag.next:
+                if flaws_tag.name and flaws_tag.name == 'h2':
+                    break
+                if type(flaws_tag) == NavigableString:
+                    d_str = ''.join((d_str, flaws_tag.string))
+                elif flaws_tag.name == 'br':
+                    d_str = ''.join((d_str, '\n'))
+                flaws_tag = flaws_tag.next
+            anc.abilityFlaws = [d for d in d_str.split('\n') if d]
+
+        lang_tag = m_tag.find_next(name='h2', text='Languages').next_sibling
+        d_str = ''
+        while lang_tag.next:
+            if lang_tag.name and lang_tag.name == 'h2':
+                anc.languages.append(d_str)
+                break
+            if type(lang_tag) == NavigableString:
+                d_str = ''.join((d_str, lang_tag.string))
+            elif lang_tag.name == 'br':
+                anc.languages.append(d_str)
+                d_str = ''
+            lang_tag = lang_tag.next
+
+        dvision_tag = m_tag.find_next(name='h2', text='Darkvision')
+        ll_tag = m_tag.find_next(name='h2', text='Low-Light Vision')
+        if dvision_tag:
+            anc.senses.append(AncestryHeader('Darkvision', 'You can see in darkness and dim light just as well as you can see in bright light, though your vision in darkness is in black and white.'))
+        elif ll_tag:
+            anc.senses.append(AncestryHeader('Low-Light Vision', 'You can see in dim light as though it were bright light, so you ignore the concealed condition due to dim light.'))
+
+        # the rest are extras
+        extras_tag: Tag = lang_tag.previous.find_next('h2')
+        if extras_tag:
+            end_tag = [x for x in extras_tag.parent.children][-1]
+            d_str: Union[str, List[List[str]]] = ''
+            d_header = ''
+            while extras_tag.next:
+                if extras_tag == end_tag.next:
+                    if type(d_str) == str:
+                        anc.extras.append(AncestryHeader(d_header, d_str.replace(d_header, '', 1)))
+                    elif type(d_str) == list:
+                        anc.extras.append(AncestryHeader(d_header, '', d_str))
+                    break
+                if type(extras_tag) == NavigableString:
+                    d_str = ''.join((d_str, extras_tag.string))
+                elif extras_tag.name == 'br':
+                    d_str = ''.join((d_str, '\n'))
+                elif extras_tag.name == 'h2':
+                    if d_str != '':
+                        anc.extras.append(AncestryHeader(d_header, d_str.replace(d_header, '', 1)))
+                    d_header = str(extras_tag.string)
+                    d_str = ''
+                elif extras_tag.name == 'table':
+                    d_str = parse_table_into_list(extras_tag)
+                    extras_tag = extras_tag.next_sibling.previous if extras_tag.next_sibling else extras_tag
+                extras_tag = extras_tag.next
+
+        ancestries.append(dataclasses.asdict(anc))
+    return ancestries
+
+
 def write_data(data: List[object], collection_name: str, index_on: str, f_name: str = None) -> None:
     if f_name:
         with open(f_name, 'w', encoding='utf-8') as outfile:
@@ -524,6 +678,10 @@ def scrape(typ: GameType, cache_only: bool = None, out_file: str = None):
         col_name: str = 'traits'
         index_on: str = 'name'
         parse_func = parse_traits
+    elif typ == GameType.ANCESTRY:
+        col_name: str = 'ancestries'
+        index_on: str = 'name'
+        parse_func = parse_ancestries
     else:
         print('Invalid GameType')
         return
